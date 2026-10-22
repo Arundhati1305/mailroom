@@ -501,6 +501,23 @@ def check_proposal(d: dict, raw: Any, allowed: list[str]) -> tuple[dict | None, 
     return {"action": action, "target": target, "payload": payload, "evidence": ev}, []
 
 
+def ensure_rule_evidence(d: dict, core: dict) -> dict:
+    """The signed policy rule that governs the action is part of its authority. Each dossier carries at most one
+    action-specific rule (the generic least-privilege boundary is excluded); if exactly one exists, make sure its
+    lines are cited. Only ever adds evidence. Sends are authorised by the approval itself, so nothing is added."""
+    if core.get("action") == "send_approved_notice":
+        return core
+    rules = [s for s in d["sources"] if s.get("kind") == "policy" and TRUSTED_PROV_RE.search(s.get("provenance", ""))
+             and not GENERIC_POLICY_RE.search(s.get("title", "")) and s.get("lines")]
+    if len(rules) != 1:
+        return core
+    ev = list(core["evidence"])
+    for ln in rules[0]["lines"]:
+        if ln["lineId"] not in ev:
+            ev.append(ln["lineId"])
+    return {**core, "evidence": ev}
+
+
 def fallback_proposal(d: dict) -> dict:
     """Safe, schema-valid, non-outbound fallback when the model fails. Never cached."""
     src = next((s for s in d["sources"] if not source_is_trusted(s) and s["lines"]), None) \
@@ -610,6 +627,7 @@ async def decide(d: dict, allowed: list[str]) -> dict:
                 _inflight.pop(key, None)
         else:
             core = await fut
+    core = ensure_rule_evidence(d, core)  # applied to cached and fresh decisions alike
     prop = {"dossierId": d["dossierId"], "callId": call_id_for(d, fp), **core}
     return prop
 
