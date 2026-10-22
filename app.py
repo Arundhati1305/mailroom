@@ -40,6 +40,7 @@ LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "450"))
 PROPOSE_BUDGET = float(os.getenv("PROPOSE_BUDGET", "47"))  # seconds; grader allows 55
 STRICT_SEND = os.getenv("STRICT_SEND", "1") == "1"
 MOCK_LLM = os.getenv("MOCK_LLM", "0") == "1"
+MAX_ATTEMPTS = int(os.getenv("MAX_ATTEMPTS", "4"))
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 
 # HTTP codes for each kind of rejection (kept in one place so they are easy to change)
@@ -555,7 +556,8 @@ async def _chat(messages: list[dict]) -> str:
                 last = f"HTTP {r.status_code}"
                 await asyncio.sleep(1.5 * (attempt + 1))
                 continue
-            r.raise_for_status()
+            if r.status_code >= 400:
+                raise RuntimeError(f"model HTTP {r.status_code}: {r.text[:300]}")
             return r.json()["choices"][0]["message"]["content"] or ""
         except (httpx.TimeoutException, httpx.TransportError) as e:
             last = repr(e)
@@ -569,25 +571,34 @@ def _mock_model(d: dict) -> str:
 
 
 async def model_decide(d: dict, allowed: list[str]) -> tuple[dict, bool]:
-    """Returns (proposal_core, cacheable)."""
+    """Returns (proposal_core, cacheable). Model errors are retried; validator feedback is fed back.
+    If no valid answer is obtained, a safe non-outbound placeholder is returned and the full
+    details (dossier, validator errors, model output, exceptions) are logged for diagnosis."""
     global _sem
     if _sem is None:
         _sem = asyncio.Semaphore(LLM_CONCURRENCY)
+    trail: list[dict] = []
     async with _sem:
         messages = [{"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": render_dossier(d, allowed)}]
-        for _ in range(3):
+        for attempt in range(MAX_ATTEMPTS):
             try:
                 text = _mock_model(d) if MOCK_LLM else await _chat(messages)
-            except Exception:
-                return fallback_proposal(d), False
+            except Exception as e:
+                trail.append({"attempt": attempt + 1, "exception": repr(e)[:500]})
+                await asyncio.sleep(1.0 + attempt)
+                continue
             prop, errs = check_proposal(d, _parse_json(text), allowed)
             if prop:
                 return prop, True
+            trail.append({"attempt": attempt + 1, "errors": errs, "output": text[:1500]})
             messages += [{"role": "assistant", "content": text[:4000]},
                          {"role": "user", "content": "The validator rejected that output:\n- " + "\n- ".join(errs)
-                          + "\nReturn corrected JSON only."}]
-        return fallback_proposal(d), False
+                          + "\nRe-read the dossier, reconsider the action if needed, and return corrected JSON only."}]
+    fb = fallback_proposal(d)
+    await log_event("fallback", {"dossierId": d["dossierId"], "partition": d["partition"], "trail": trail,
+                                 "dossier": d})
+    return fb, False
 
 
 def dossier_fp(d: dict) -> str:
