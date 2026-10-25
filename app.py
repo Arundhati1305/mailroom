@@ -4,11 +4,16 @@ One POST endpoint ("/") handles `propose` and `commit`.
 Code owns: schema validation, canonical hashing, persistence, replay/409,
 receipt signature checks, and safety checks on model output.
 The model only reads a dossier and suggests an action, which code then validates.
+
+GET /healthz is a cheap liveness probe (no DB, no model). On Render, a background
+task pings it every few minutes so the free-tier instance never goes to sleep.
 """
 import asyncio
 import base64
+import contextlib
 import hashlib
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -42,6 +47,16 @@ STRICT_SEND = os.getenv("STRICT_SEND", "1") == "1"
 MOCK_LLM = os.getenv("MOCK_LLM", "0") == "1"
 MAX_ATTEMPTS = int(os.getenv("MAX_ATTEMPTS", "4"))
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+
+# Keep-alive (Render free tier sleeps after ~15 min without inbound traffic).
+# Render sets RENDER_EXTERNAL_URL automatically; locally it is absent, so pinging stays off.
+_render_url = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+KEEPALIVE_URL = os.getenv("KEEPALIVE_URL", f"{_render_url}/healthz" if _render_url else "")
+KEEPALIVE_MINUTES = 10  # ping every 10 minutes (Render sleeps after 15 minutes idle)
+KEEPALIVE_INTERVAL = KEEPALIVE_MINUTES * 60  # seconds
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("mailroom")  # never log bodies
 
 # HTTP codes for each kind of rejection (kept in one place so they are easy to change)
 HTTP_BAD_JSON = 400
@@ -762,8 +777,41 @@ async def op_commit(body: dict) -> str:
         return json.loads(await db(store().get, f"commit:{eid}"))["response"]
 
 
+# ----------------------------------------------------------------- keep-alive (Render free tier)
+async def keepalive_loop() -> None:
+    """Ping our own public URL so Render sees inbound traffic and never idles the service."""
+    await asyncio.sleep(30)  # let the server finish booting
+    async with httpx.AsyncClient(timeout=10) as client:
+        while True:
+            try:
+                r = await client.get(KEEPALIVE_URL, headers={"User-Agent": "mailroom-keepalive"})
+                if r.status_code >= 400:
+                    log.warning("keep-alive ping returned HTTP %s", r.status_code)
+            except Exception as e:  # never let a failed ping kill the loop
+                log.warning("keep-alive ping failed: %s", type(e).__name__)
+            await asyncio.sleep(KEEPALIVE_INTERVAL)
+
+
+@contextlib.asynccontextmanager
+async def lifespan(_app):
+    task = None
+    if KEEPALIVE_URL:
+        task = asyncio.create_task(keepalive_loop())
+        log.info("keep-alive enabled: every %ss", KEEPALIVE_INTERVAL)
+    try:
+        yield
+    finally:
+        if task:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        if _client is not None:
+            with contextlib.suppress(Exception):
+                await _client.aclose()
+
+
 # ----------------------------------------------------------------- HTTP
-app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 app.router.redirect_slashes = False
 
 
@@ -780,6 +828,12 @@ def _commit_summary(body: dict, code: int, msg: str) -> dict:
                           for k in ("dossierId", "callId", "action", "accepted", "receiptId", "proposalDigest")}
                          | {"sig": (str(r.get("receiptSignature"))[:10] + "...", len(str(r.get("receiptSignature"))))}
                          for r in rs[:80] if isinstance(r, dict)]}
+
+
+@app.api_route("/healthz", methods=["GET", "HEAD"])
+async def healthz() -> Response:
+    # cheap liveness probe: no DB, no model call
+    return jresp(200, {"ok": True, "profile": PROFILE})
 
 
 @app.get("/")
